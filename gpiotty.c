@@ -35,34 +35,76 @@ MODULE_LICENSE ( "GPL" );
 #define GPIOTTY_SERIAL_MINORS 1
 #define GPIOTTY_RX_PIN 24
 
+#define GPIOTTY_RINGSIZE 1024
+
+#define GPIOTTY_BAUD 9600
+#define GPIOTTY_BAUD_US (1.0/GPIOTTY_BAUD)*1000000
+
 #define UART_NR 1
 
 #define GPIOTTY_NAME "ttyGPIO"
 
 #define MY_NAME GPIOTTY_NAME
 
+struct gpiotty_uart_port {
+  struct uart_port uart;
+  struct tasklet_struct tasklet;
+  struct circ_buf rx_ring;
+};
+
+struct gpiotty_uart_char {
+  u16 ch;
+};
+
+static inline struct gpiotty_uart_port *
+to_gpiotty_uart_port(struct uart_port *uart)
+{
+  return container_of(uart, struct gpiotty_uart_port, uart);
+}
+
+static inline void gpiotty_buffer_rx_char(struct uart_port *port, unsigned int byte)
+{
+  struct gpiotty_uart_port *gpiotty_port = to_gpiotty_uart_port(port);
+  struct circ_buf *ring = &gpiotty_port->rx_ring;
+  struct gpiotty_uart_char *c;
+
+  if (!CIRC_SPACE(ring->head, ring->tail, GPIOTTY_RINGSIZE))
+    return;
+
+  c = &((struct gpiotty_uart_char *)ring->buf)[ring->head];
+  c->ch = byte;
+
+  smp_wmb();
+
+  ring->head = (ring->head + 1 ) & (GPIOTTY_RINGSIZE - 1);
+}
+
 static irqreturn_t cb_gpio_irq(int irq, void *dev)
 {
-  struct uart_port *port;
-  struct tty_struct *tty;
-  struct tty_port *tty_port;
-  char byte = 0;
-  int i;
+  struct uart_port *port = (struct uart_port *)dev;
+  struct gpiotty_uart_port *gpiotty_port = to_gpiotty_uart_port(port);
+  u8 byte = 0;
+  u8 i, noti;
 
-  port = (struct uart_port*)dev;
-  tty = port->state->port.tty;
-  tty_port = tty->port;
+  //Wait a third of a bit to not sample the edges, and to have some margin
+  //for CPU cycles spent not-reading
+  udelay(GPIOTTY_BAUD_US/3);
 
-  printk(KERN_DEBUG "gpiotty: got serial port activity on pin\n");
-
-  for (i=0;i<8;i++) {
-    byte |= gpio_get_value(GPIOTTY_RX_PIN);
-    byte = byte << 1;
-    mdelay(1);
+  for (i = 0x1; i; i <<= 1) {
+    udelay(GPIOTTY_BAUD_US);
+    noti = ~i;
+    if (gpio_get_value(GPIOTTY_RX_PIN))
+      byte |= i;
+    else // Else added to ensure timing is ~balanced
+      byte &= noti;
   }
 
-  tty_insert_flip_char(tty_port, byte, TTY_NORMAL);
-  tty_flip_buffer_push(tty_port);
+  // Skip stop bit
+  udelay(GPIOTTY_BAUD_US);
+
+  gpiotty_buffer_rx_char(port, byte);
+
+  tasklet_schedule(&gpiotty_port->tasklet);
 
   return IRQ_HANDLED;
 }
@@ -105,33 +147,83 @@ static void gpiotty_set_termios(struct uart_port *port, struct ktermios *new, st
 {
 }
 
+static void gpiotty_tasklet_func(unsigned long data)
+{
+  struct uart_port *port = (struct uart_port *)data;
+  struct gpiotty_uart_port *gpiotty_port = to_gpiotty_uart_port(port);
+  struct circ_buf *ring = &gpiotty_port->rx_ring;
+
+  while (ring->head != ring->tail) {
+    struct gpiotty_uart_char c;
+
+    smp_rmb();
+
+    c = ((struct gpiotty_uart_char *)ring->buf)[ring->tail];
+    ring->tail = (ring->tail + 1) & (GPIOTTY_RINGSIZE - 1);
+    port->icount.rx++;
+
+    uart_insert_char(port, 0, 0, c.ch, TTY_NORMAL);
+  }
+
+  tty_flip_buffer_push(&port->state->port);
+}
+
 static int gpiotty_startup(struct uart_port *port)
 {
   int err;
+  struct gpiotty_uart_port *gpiotty_port = to_gpiotty_uart_port(port);
+  void *data;
 
   printk(KERN_ERR "gpiotty: starting gpiotty on pin\n");
+
+  tasklet_init(&gpiotty_port->tasklet, gpiotty_tasklet_func, (unsigned long)port);
+
+  memset(&gpiotty_port->rx_ring, 0, sizeof(gpiotty_port->rx_ring));
+
+  err = -ENOMEM;
+  data = kmalloc(sizeof(struct gpiotty_uart_char) * GPIOTTY_RINGSIZE, GFP_KERNEL);
+
+  if (!data)
+    goto err_alloc_ring;
+
+  gpiotty_port->rx_ring.buf = data;
 
   err = gpio_request_one(GPIOTTY_RX_PIN, GPIOF_DIR_IN | GPIOF_EXPORT_DIR_FIXED, "gpiotty rx pin");
   if (err) {
     printk(KERN_ERR "gpiotty: could not request pin: %i\n", err);
-    return - EBUSY;
+    goto err_add_port;
   }
 
-  err = request_irq(gpio_to_irq(GPIOTTY_RX_PIN), cb_gpio_irq, IRQF_TRIGGER_RISING, "gpiotty rx pin", port);
+  err = request_irq(gpio_to_irq(GPIOTTY_RX_PIN), cb_gpio_irq, IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING | IRQF_TRIGGER_LOW | IRQF_NOBALANCING | IRQF_NO_THREAD, "gpiotty rx pin", port);
   if (err) {
     printk(KERN_ERR "gpiotty: could not request IRQ for pin: %i\n", err);
-    return -EIO;
+    goto err_add_port;
   }
 
   printk(KERN_DEBUG "gpiotty: pin opened\n");
 
   return 0;
+
+err_add_port:
+  kfree(gpiotty_port->rx_ring.buf);
+  gpiotty_port->rx_ring.buf = NULL;
+err_alloc_ring:
+  return err;
 }
 
 static void gpiotty_shutdown(struct uart_port *port)
 {
+  struct gpiotty_uart_port *gpiotty_port = to_gpiotty_uart_port(port);
+
+  tasklet_kill(&gpiotty_port->tasklet);
+  gpiotty_port->rx_ring.head = 0;
+  gpiotty_port->rx_ring.tail = 0;
+
+  kfree(gpiotty_port->rx_ring.buf);
+
   free_irq(gpio_to_irq(GPIOTTY_RX_PIN), port);
   gpio_free(GPIOTTY_RX_PIN);
+
   printk(KERN_DEBUG "gpiotty: pin closed and released\n");
 }
 
@@ -177,8 +269,11 @@ static struct uart_ops gpiotty_ops = {
   .verify_port  = gpiotty_verify_port,
 };
 
-static struct uart_port gpiotty_port = {
-  .ops = &gpiotty_ops,
+static struct gpiotty_uart_port static_gpiotty_port = {
+  .uart = {
+    .ops = &gpiotty_ops,
+    .type = PORT_MAX
+  }
 };
 
 static struct uart_driver gpiotty_reg = {
@@ -200,7 +295,7 @@ static int __init gpiotty_init(void)
     return err;
   }
 
-  err = uart_add_one_port(&gpiotty_reg, &gpiotty_port);
+  err = uart_add_one_port(&gpiotty_reg, &static_gpiotty_port.uart);
   if (err) {
     printk(KERN_ERR "gpiotty: could not add port: %d\n", err);
     uart_unregister_driver(&gpiotty_reg);
@@ -214,7 +309,7 @@ static int __init gpiotty_init(void)
 
 static void __exit gpiotty_exit(void)
 {
-  uart_remove_one_port(&gpiotty_reg, &gpiotty_port);
+  uart_remove_one_port(&gpiotty_reg, &static_gpiotty_port.uart);
   uart_unregister_driver(&gpiotty_reg);
   printk(KERN_DEBUG "gpiotty: unloaded\n");
 }
